@@ -26,7 +26,7 @@ use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
 use crate::{Checkpoint, DbIterator};
 use async_trait::async_trait;
 use bytes::Bytes;
-use fail_parallel::FailPointRegistry;
+use fail_parallel::{fail_point, FailPointRegistry};
 use futures::stream::BoxStream;
 use log::info;
 use object_store::path::Path;
@@ -124,6 +124,7 @@ impl DbReaderInner {
                 &options,
                 checkpoint,
                 replay_new_wals,
+                Arc::clone(&fp_registry),
             )
             .await?,
         );
@@ -272,6 +273,7 @@ impl DbReaderInner {
                 current_checkpoint.core(),
                 &mut imm_memtable,
                 true,
+                Arc::clone(&self.fp_registry),
             )
             .await?;
 
@@ -294,6 +296,7 @@ impl DbReaderInner {
         options: &DbReaderOptions,
         checkpoint: Checkpoint,
         replay_new_wals: bool,
+        fp_registry: Arc<FailPointRegistry>,
     ) -> Result<CheckpointState, SlateDBError> {
         let manifest = manifest_store.read_manifest(checkpoint.manifest_id).await?;
         let imm_memtable = VecDeque::new();
@@ -304,6 +307,7 @@ impl DbReaderInner {
             replay_new_wals,
             Arc::clone(&table_store),
             options,
+            Arc::clone(&fp_registry),
         )
         .await
     }
@@ -332,6 +336,7 @@ impl DbReaderInner {
             !self.options.skip_wal_replay,
             Arc::clone(&self.table_store),
             &self.options,
+            Arc::clone(&self.fp_registry),
         )
         .await
     }
@@ -343,6 +348,7 @@ impl DbReaderInner {
         replay_new_wals: bool,
         table_store: Arc<TableStore>,
         options: &DbReaderOptions,
+        fp_registry: Arc<FailPointRegistry>,
     ) -> Result<CheckpointState, SlateDBError> {
         let (last_wal_id, last_committed_seq) = Self::replay_wal_into(
             Arc::clone(&table_store),
@@ -350,6 +356,7 @@ impl DbReaderInner {
             &manifest.core,
             &mut imm_memtable,
             replay_new_wals,
+            Arc::clone(&fp_registry),
         )
         .await?;
 
@@ -412,7 +419,9 @@ impl DbReaderInner {
         core: &ManifestCore,
         into_tables: &mut VecDeque<Arc<ImmutableMemtable>>,
         replay_new_wals: bool,
+        fp_registry: Arc<FailPointRegistry>,
     ) -> Result<(u64, u64), SlateDBError> {
+
         let sst_iter_options = SstIteratorOptions {
             max_fetch_tasks: 1,
             blocks_to_fetch: 256,
@@ -446,6 +455,10 @@ impl DbReaderInner {
             Arc::clone(&table_store),
         )
         .await?;
+
+        fail_point!(fp_registry, "replay-wal-into", |_| {
+            Err(SlateDBError::from(std::io::Error::other("oops")))
+        }); // this is here to test if last_seen_wal_id() called above is stale
 
         let mut last_wal_id = 0;
         let mut last_committed_seq = 0;
@@ -507,7 +520,7 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
             .should_reestablish_checkpoint(&latest_manifest.core)
         {
             let checkpoint = self.inner.replace_checkpoint(&mut manifest).await?;
-            self.inner.reestablish_checkpoint(checkpoint).await?;
+            self.inner.reestablish_checkpoint(checkpoint).await?; // this replays wals too
         } else {
             // TODO: check if there are new wals, if so, add last seen wal id to the checkpoint
             self.inner.maybe_replay_new_wals().await?;
@@ -1101,6 +1114,7 @@ mod tests {
             DbReaderOptions::default(),
             test_provider.system_clock.clone(),
             test_provider.rand.clone(),
+            Arc::clone(&test_provider.fp_registry),
         )
         .await
         .unwrap();
@@ -1330,15 +1344,15 @@ mod tests {
         .await
         .unwrap();
 
+        // open reader. the reader should try to replay the new wal and pause.
         fail_parallel::cfg(
             Arc::clone(&test_provider.fp_registry),
-            "list-wal-ssts", // TODO: add a new failpoint after listing wal sst
+            "replay-wal-into",
             "pause",
         )
         .unwrap();
         let reader_options = DbReaderOptions {
-            manifest_poll_interval: Duration::from_millis(500),
-            checkpoint_lifetime: Duration::from_millis(1000),
+            manifest_poll_interval: Duration::from_millis(100),
             ..DbReaderOptions::default()
         };
         let reader = test_provider
@@ -1346,13 +1360,14 @@ mod tests {
             .await
             .unwrap();
 
+        // flush the memtable which will allow the WAL to be GC'ed
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::MemTable,
         })
         .await
         .unwrap();
 
-        // Run a manual GC  to attempt to delete the WAL
+        // Run a manual GC to attempt to delete the WAL
         let gc = GarbageCollectorBuilder::new(path.clone(), object_store.clone())
             .with_options(GarbageCollectorOptions {
                 wal_options: Some(GarbageCollectorDirectoryOptions {
@@ -1377,10 +1392,10 @@ mod tests {
             wals.iter().map(|wal| wal.id).collect::<Vec<_>>()
         );
 
-        // unpause the failpoint so the reader can read the WAL and the key-value
+        // unpause to allow the reader to download the WAL. 
         fail_parallel::cfg(
             Arc::clone(&test_provider.fp_registry),
-            "list-wal-ssts",
+            "replay-wal-into",
             "off",
         )
         .unwrap();
