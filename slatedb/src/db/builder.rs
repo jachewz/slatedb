@@ -1085,6 +1085,7 @@ pub struct DbReaderBuilder<P: Into<Path>> {
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
     stat_registry: Arc<StatRegistry>,
+    fp_registry: Arc<FailPointRegistry>,
 }
 
 impl<P: Into<Path>> DbReaderBuilder<P> {
@@ -1099,6 +1100,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             system_clock: Arc::new(DefaultSystemClock::default()),
             rand: Arc::new(DbRand::default()),
             stat_registry: Arc::new(StatRegistry::new()),
+            fp_registry: Arc::new(FailPointRegistry::new()),
         }
     }
 
@@ -1141,6 +1143,12 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
     /// Sets the stats registry to use for the reader.
     pub fn with_stat_registry(mut self, stat_registry: Arc<StatRegistry>) -> Self {
         self.stat_registry = stat_registry;
+        self
+    }
+
+    /// Sets the fail point registry to use for the database.
+    pub fn with_fp_registry(mut self, fp_registry: Arc<FailPointRegistry>) -> Self {
+        self.fp_registry = fp_registry;
         self
     }
 
@@ -1203,6 +1211,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             self.options,
             self.system_clock,
             self.rand,
+            self.fp_registry,
         )
         .await
         .map_err(crate::Error::from)?;

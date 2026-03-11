@@ -26,6 +26,7 @@ use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
 use crate::{Checkpoint, DbIterator};
 use async_trait::async_trait;
 use bytes::Bytes;
+use fail_parallel::FailPointRegistry;
 use futures::stream::BoxStream;
 use log::info;
 use object_store::path::Path;
@@ -61,6 +62,7 @@ struct DbReaderInner {
     reader: Reader,
     closed_result_watcher: ClosedResultWriter,
     rand: Arc<DbRand>,
+    fp_registry: Arc<FailPointRegistry>,
 }
 
 #[derive(Debug)]
@@ -102,6 +104,7 @@ impl DbReaderInner {
         closed_result_watcher: ClosedResultWriter,
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
+        fp_registry: Arc<FailPointRegistry>,
     ) -> Result<Self, SlateDBError> {
         let mut manifest =
             StoredManifest::load(Arc::clone(&manifest_store), system_clock.clone()).await?;
@@ -160,6 +163,7 @@ impl DbReaderInner {
             reader,
             closed_result_watcher,
             rand,
+            fp_registry,
         })
     }
 
@@ -505,6 +509,7 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
             let checkpoint = self.inner.replace_checkpoint(&mut manifest).await?;
             self.inner.reestablish_checkpoint(checkpoint).await?;
         } else {
+            // TODO: check if there are new wals, if so, add last seen wal id to the checkpoint
             self.inner.maybe_replay_new_wals().await?;
         }
 
@@ -637,6 +642,7 @@ impl DbReader {
         options: DbReaderOptions,
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
+        fp_registry: Arc<FailPointRegistry>,
     ) -> Result<Self, SlateDBError> {
         Self::validate_options(&options)?;
 
@@ -654,6 +660,7 @@ impl DbReader {
                 closed_result_watcher,
                 system_clock,
                 rand,
+                fp_registry,
             )
             .await?,
         );
@@ -1650,6 +1657,7 @@ mod tests {
                 options,
                 self.system_clock.clone(),
                 self.rand.clone(),
+                self.fp_registry.clone(),
             )
             .await
         }
