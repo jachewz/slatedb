@@ -1012,7 +1012,10 @@ impl DbRead for DbReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{CheckpointOptions, CheckpointScope, Settings};
+    use crate::config::{CheckpointOptions, CheckpointScope, 
+        GarbageCollectorDirectoryOptions, GarbageCollectorOptions, 
+        FlushOptions, FlushType, Settings};
+    use crate::db::builder::GarbageCollectorBuilder;
     use crate::db_reader::{DbReader, DbReaderOptions};
     use crate::db_state::ManifestCore;
     use crate::format::sst::SsTableFormat;
@@ -1296,6 +1299,84 @@ mod tests {
         let value = b"test_value";
         db.put(key, value).await.unwrap();
         db.flush().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            reader.get(key).await.unwrap(),
+            Some(Bytes::from_static(value))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_prevent_wal_deletion_while_replaying() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_kv_store");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+
+        let key = b"test_key";
+        let value = b"test_value";
+        db.put(key, value).await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+
+        fail_parallel::cfg(
+            Arc::clone(&test_provider.fp_registry),
+            "list-wal-ssts", // TODO: add a new failpoint after listing wal sst
+            "pause",
+        )
+        .unwrap();
+        let reader_options = DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(500),
+            checkpoint_lifetime: Duration::from_millis(1000),
+            ..DbReaderOptions::default()
+        };
+        let reader = test_provider
+            .new_db_reader(reader_options, None)
+            .await
+            .unwrap();
+
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        // Run a manual GC  to attempt to delete the WAL
+        let gc = GarbageCollectorBuilder::new(path.clone(), object_store.clone())
+            .with_options(GarbageCollectorOptions {
+                wal_options: Some(GarbageCollectorDirectoryOptions {
+                    interval: None,
+                    min_age: Duration::from_millis(0),
+                }),
+                ..Default::default()
+            })
+            .build();
+        gc.run_gc_once().await;
+
+        let wals = db
+                .inner
+                .table_store
+                .list_wal_ssts(..)
+                .await
+                .expect("failed to list wal ssts after manual GC");
+        assert_eq!(
+            wals.len(),
+            1,
+            "expected exactly one WAL even after GC, but found {:?}",
+            wals.iter().map(|wal| wal.id).collect::<Vec<_>>()
+        );
+
+        // unpause the failpoint so the reader can read the WAL and the key-value
+        fail_parallel::cfg(
+            Arc::clone(&test_provider.fp_registry),
+            "list-wal-ssts",
+            "off",
+        )
+        .unwrap();
 
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
